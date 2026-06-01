@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { GoogleGenerativeAI, SchemaType } from '@google/generative-ai';
 import type { ChatSession, FunctionDeclaration, GenerateContentResult } from '@google/generative-ai';
-import { Activity, Send, ShieldAlert, Sparkles } from 'lucide-react';
+import { Activity, Send, ShieldAlert, Sparkles, Pencil, Copy, Check } from 'lucide-react';
 import { CHAT_WELCOME_MESSAGE, formatChatUid } from '../utils/chatConversations';
 import type { ChatConversation, ChatMessage, SubnetPresentation } from '../types';
 import { activeProvider, withRpcBackoff } from '../utils/rpc';
@@ -142,6 +142,10 @@ export default function ChatPortal({
   const input = inputByConversationId[conversation.id] ?? '';
   const loading = loadingConversationId === conversation.id;
 
+  const [editingMessageIndex, setEditingMessageIndex] = useState<number | null>(null);
+  const [editingText, setEditingText] = useState<string>('');
+  const [copiedMessageIndex, setCopiedMessageIndex] = useState<number | null>(null);
+
   const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
   const model = useMemo(
     () =>
@@ -165,6 +169,32 @@ export default function ChatPortal({
       textareaRef.current.style.height = 'auto';
     }
   }, [conversation.id]);
+
+  useEffect(() => {
+    if (account) {
+      // Wallet is connected!
+      // Check if there is a stale wallet_connect warning message in current history
+      const walletConnectMsgIndex = messages.findIndex(
+        (msg) => msg.role === 'model' && msg.action?.type === 'wallet_connect'
+      );
+      if (walletConnectMsgIndex !== -1) {
+        // Find the user message before it
+        let userMsgText = '';
+        let userMsgIndex = -1;
+        for (let i = walletConnectMsgIndex - 1; i >= 0; i--) {
+          if (messages[i].role === 'user') {
+            userMsgText = messages[i].text;
+            userMsgIndex = i;
+            break;
+          }
+        }
+        if (userMsgText && userMsgIndex !== -1) {
+          // Trigger the resubmission of that user prompt at its index
+          handleResubmitMessage(userMsgIndex, userMsgText);
+        }
+      }
+    }
+  }, [account, conversation.id, messages]);
 
   const setConversationInput = (value: string) => {
     setInputByConversationId((previousInputs) => ({
@@ -195,16 +225,62 @@ export default function ChatPortal({
         parts: [{ text: message.text }],
       }));
 
-  const getChatSession = (activeConversation: ChatConversation) => {
+  const getChatSession = (activeConversation: ChatConversation, overrideMessages?: ChatMessage[]) => {
     if (!model) return null;
 
     const existingSession = chatSessionsRef.current[activeConversation.id];
     if (existingSession) return existingSession;
 
-    const nextSession = model.startChat({ history: buildChatHistory(activeConversation.messages) });
+    const messagesToUse = overrideMessages ?? activeConversation.messages;
+    const nextSession = model.startChat({ history: buildChatHistory(messagesToUse) });
     chatSessionsRef.current[activeConversation.id] = nextSession;
 
     return nextSession;
+  };
+
+  const handleResubmitMessage = async (indexToReplace: number, newText: string) => {
+    const conversationId = conversation.id;
+    const updatedMessages = [
+      ...messages.slice(0, indexToReplace),
+      { role: 'user' as const, text: newText },
+    ];
+    updateMessages(conversationId, () => updatedMessages);
+
+    delete chatSessionsRef.current[conversationId];
+
+    const prevMessagesHistory = messages.slice(0, indexToReplace);
+    const chatSession = getChatSession(conversation, prevMessagesHistory);
+    if (!chatSession) return;
+
+    setLoadingConversationId(conversationId);
+    try {
+      const result = await chatSession.sendMessage(newText);
+      await processResponse(result, chatSession, conversationId);
+    } catch (error: unknown) {
+      console.error(error);
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      updateMessages(conversationId, (previousMessages) => [
+        ...previousMessages,
+        {
+          role: 'model',
+          text: `I hit a network issue while preparing that response: ${errorMessage}`,
+        },
+      ]);
+    } finally {
+      clearConversationLoading(conversationId);
+    }
+  };
+
+  const handleCopyMessage = async (text: string, index: number) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedMessageIndex(index);
+      setTimeout(() => {
+        setCopiedMessageIndex((current) => current === index ? null : current);
+      }, 2000);
+    } catch (err) {
+      console.error('Failed to copy text:', err);
+    }
   };
 
   const adjustTextareaHeight = () => {
@@ -606,10 +682,72 @@ export default function ChatPortal({
                   {message.role === 'user' ? 'U' : <Sparkles size={15} />}
                 </div>
 
-                <div className={`bub ${message.role === 'user' ? 'user' : 'bot'}`}>
-                  <div className="chat-markdown">
-                    <ReactMarkdown>{message.text}</ReactMarkdown>
-                  </div>
+                <div className={`bub ${message.role === 'user' ? 'user' : 'bot'} ${editingMessageIndex === index ? 'editing' : ''}`}>
+                  {message.role === 'user' && editingMessageIndex === index ? (
+                    <div className="bub-edit-container">
+                      <textarea
+                        className="bub-edit-textarea"
+                        value={editingText}
+                        onChange={(e) => setEditingText(e.target.value)}
+                        autoFocus
+                      />
+                      <div className="bub-edit-actions">
+                        <button
+                          type="button"
+                          className="btn-confirm"
+                          onClick={() => {
+                            if (editingText.trim()) {
+                              handleResubmitMessage(index, editingText.trim());
+                              setEditingMessageIndex(null);
+                            }
+                          }}
+                        >
+                          Save & Submit
+                        </button>
+                        <button
+                          type="button"
+                          className="btn-cancel"
+                          onClick={() => setEditingMessageIndex(null)}
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <>
+                      <div className="chat-markdown">
+                        <ReactMarkdown>{message.text}</ReactMarkdown>
+                      </div>
+
+                      {message.role === 'user' && !message.text.startsWith('[System]') && (
+                        <div className="user-msg-actions">
+                          <button
+                            type="button"
+                            className="user-msg-action-btn"
+                            title="Edit prompt"
+                            onClick={() => {
+                              setEditingMessageIndex(index);
+                              setEditingText(message.text);
+                            }}
+                          >
+                            <Pencil size={13} />
+                          </button>
+                          <button
+                            type="button"
+                            className="user-msg-action-btn"
+                            title="Copy prompt"
+                            onClick={() => handleCopyMessage(message.text, index)}
+                          >
+                            {copiedMessageIndex === index ? (
+                              <Check size={13} style={{ color: '#10b981' }} />
+                            ) : (
+                              <Copy size={13} />
+                            )}
+                          </button>
+                        </div>
+                      )}
+                    </>
+                  )}
 
                   {message.action && message.action.type === 'wallet_connect' && (
                     <button
