@@ -161,7 +161,7 @@
 .thinking-row {
   width: fit-content;
   max-width: 900px;
-  margin: 0 auto;
+  margin: 0;
   padding-left: 44px;
   color: var(--text-3);
 }

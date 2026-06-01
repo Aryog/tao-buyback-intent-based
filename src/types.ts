@@ -6,7 +6,7 @@ export type HistorySource = 'wallet' | 'contract';
 export type StatusState = { type: 'idle' | 'loading' | 'success' | 'error'; msg: string };
 
 export interface ChatAction {
-  type: 'stake' | 'unstake' | 'swap';
+  type: 'stake' | 'unstake' | 'swap' | 'wallet_connect';
   amount?: string;
   netuid: number;
   targetNetuid?: number;

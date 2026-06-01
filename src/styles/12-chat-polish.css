@@ -153,3 +153,74 @@
     margin-top: 12px;
   }
 }
+
+/* Wallet Connect Chat Prompt Card */
+.wallet-connect-chat-card {
+  max-width: 600px;
+  width: 90%;
+  margin: 20px auto;
+  padding: 24px;
+  border: 1px dashed rgba(255, 255, 255, 0.15);
+  border-radius: 16px;
+  background: linear-gradient(135deg, rgba(255, 255, 255, 0.02) 0%, rgba(255, 255, 255, 0.01) 100%);
+  -webkit-backdrop-filter: blur(16px);
+  backdrop-filter: blur(16px);
+  box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.2);
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.wallet-connect-chat-card:hover {
+  border-color: rgba(255, 154, 101, 0.3);
+  box-shadow: 0 12px 40px 0 rgba(255, 154, 101, 0.08);
+  transform: translateY(-2px);
+}
+
+.wallet-connect-chat-card-title {
+  font-size: 16px;
+  font-weight: 700;
+  color: #ff9a65;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  letter-spacing: 0.02em;
+}
+
+.wallet-connect-chat-card-desc {
+  font-size: 13.5px;
+  line-height: 1.6;
+  color: var(--text-2);
+}
+
+.wallet-connect-chat-card-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 10px 24px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 154, 101, 0.4);
+  background: linear-gradient(135deg, rgba(255, 154, 101, 0.15) 0%, rgba(255, 154, 101, 0.05) 100%);
+  color: #ff9a65;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease-in-out;
+  box-shadow: 0 4px 15px rgba(255, 154, 101, 0.1);
+}
+
+.wallet-connect-chat-card-btn:hover {
+  background: linear-gradient(135deg, rgba(255, 154, 101, 0.25) 0%, rgba(255, 154, 101, 0.1) 100%);
+  border-color: rgba(255, 154, 101, 0.6);
+  transform: scale(1.03);
+  box-shadow: 0 6px 20px rgba(255, 154, 101, 0.2);
+}
+
+.wallet-connect-chat-card-btn:active {
+  transform: scale(0.98);
+}
+

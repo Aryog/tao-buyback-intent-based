@@ -4,7 +4,10 @@ import { GoogleGenerativeAI, SchemaType } from '@google/generative-ai';
 import type { ChatSession, FunctionDeclaration, GenerateContentResult } from '@google/generative-ai';
 import { Activity, Send, ShieldAlert, Sparkles } from 'lucide-react';
 import { CHAT_WELCOME_MESSAGE, formatChatUid } from '../utils/chatConversations';
-import type { ChatConversation, ChatMessage } from '../types';
+import type { ChatConversation, ChatMessage, SubnetPresentation } from '../types';
+import { activeProvider, withRpcBackoff } from '../utils/rpc';
+import { getHotkeyForNetuid } from '../utils/subnets';
+import { ethers } from 'ethers';
 
 interface ChatPortalProps {
   conversation: ChatConversation;
@@ -25,12 +28,13 @@ interface ChatPortalProps {
   executeSwap: (sourceNetuid: number, targetNetuid: number, amount: string) => Promise<boolean>;
   status: { type: 'idle' | 'loading' | 'success' | 'error'; msg: string };
   openWalletSelector: () => void;
-  disconnectWallet: () => void;
   onStartConversation: (conversationId: string, firstPrompt: string) => void;
   onUpdateConversationMessages: (
     conversationId: string,
     updater: (messages: ChatMessage[]) => ChatMessage[],
   ) => void;
+  getUiSubnetPresentation: (netuid: number) => SubnetPresentation;
+  availableNetuids: number[];
 }
 
 const stakeTool: FunctionDeclaration = {
@@ -87,6 +91,20 @@ const checkBalancesTool: FunctionDeclaration = {
   },
 };
 
+const getSubnetDetailsTool: FunctionDeclaration = {
+  name: 'get_subnet_details',
+  description: 'Get real-time details about a single Bittensor subnet or all available subnets. Returns the netuid, name, code, category, APY, hotkey, and current Alpha token price.',
+  parameters: {
+    type: SchemaType.OBJECT,
+    properties: {
+      netuid: {
+        type: SchemaType.NUMBER,
+        description: 'Optional. The netuid of the specific subnet to retrieve details for. If omitted, retrieves details for all subnets.',
+      },
+    },
+  },
+};
+
 const INPUT_HINTS = [
   { label: '↑ Stake', prompt: 'Stake 50 TAO on Subnet 19' },
   { label: '↓ Unstake', prompt: 'Unstake my Subnet 27 position' },
@@ -109,8 +127,11 @@ export default function ChatPortal({
   executeUnstake,
   executeSwap,
   status,
+  openWalletSelector,
   onStartConversation,
   onUpdateConversationMessages,
+  getUiSubnetPresentation,
+  availableNetuids,
 }: ChatPortalProps) {
   const messages = conversation.messages;
   const [inputByConversationId, setInputByConversationId] = useState<Record<string, string>>({});
@@ -126,11 +147,11 @@ export default function ChatPortal({
     () =>
       apiKey
         ? new GoogleGenerativeAI(apiKey).getGenerativeModel({
-            model: 'gemini-2.5-flash',
-            tools: [{ functionDeclarations: [stakeTool, unstakeTool, swapTool, checkBalancesTool] }],
-            systemInstruction:
-              'You are TaoChat for a Bittensor staking dashboard. Help users stake TAO, unstake Alpha, and move positions between Bittensor subnets. Cross-chain deposits are not live yet, so if a user asks about SOL, ETH, bridging, or cross-chain, clearly say it is coming soon and steer them toward the live on-chain staking flows. Be concise, clear, and action-oriented. When the user wants to act, always call the provided tool instead of only describing the action.',
-          })
+          model: 'gemini-2.5-flash',
+          tools: [{ functionDeclarations: [stakeTool, unstakeTool, swapTool, checkBalancesTool, getSubnetDetailsTool] }],
+          systemInstruction:
+            'You are TaoChat for a Bittensor staking dashboard. Help users stake TAO, unstake Alpha, move positions between Bittensor subnets, and check subnet details. You have access to real-time tools to check wallet balances (check_balances) and get subnet details (get_subnet_details) including the current Alpha token price. Cross-chain deposits are not live yet, so if a user asks about SOL, ETH, bridging, or cross-chain, clearly say it is coming soon and steer them toward the live on-chain staking flows. Be concise, clear, and action-oriented. When the user wants to act, always call the provided tool instead of only describing the action.',
+        })
         : null,
     [apiKey],
   );
@@ -213,19 +234,35 @@ export default function ChatPortal({
   const handleSend = async () => {
     if (!input.trim() || !chatReady) return;
 
-    const chatSession = getChatSession(conversation);
-    if (!chatSession) return;
-
     const userText = input.trim();
     const conversationId = conversation.id;
     onStartConversation(conversationId, userText);
     setConversationInput('');
     updateMessages(conversationId, (previousMessages) => [...previousMessages, { role: 'user', text: userText }]);
-    setLoadingConversationId(conversationId);
 
     if (textareaRef.current) {
       textareaRef.current.style.height = 'auto';
     }
+
+    if (!account) {
+      setLoadingConversationId(conversationId);
+      setTimeout(() => {
+        updateMessages(conversationId, (previousMessages) => [
+          ...previousMessages,
+          {
+            role: 'model',
+            text: "It looks like your wallet is not connected. To chat with TaoChat, view subnet stakes, query balances, or execute transactions, please connect your wallet first using the card below.",
+            action: { type: 'wallet_connect' } as any,
+          },
+        ]);
+        setLoadingConversationId(null);
+      }, 750);
+      return;
+    }
+
+    const chatSession = getChatSession(conversation);
+    if (!chatSession) return;
+    setLoadingConversationId(conversationId);
 
     try {
       const result = await chatSession.sendMessage(userText);
@@ -256,17 +293,28 @@ export default function ChatPortal({
     if (calls && calls.length > 0) {
       for (const call of calls) {
         if (call.name === 'check_balances') {
-          const functionResponse = {
-            name: call.name,
-            response: {
-              taoBalance: balance,
-              currentNetuidAlphaBalance: myAlphaBalance,
-              allAlphaBalancesByNetuid: allAlphaBalances,
-              currentNetuid,
-            },
-          };
-          const nextResult = await chatSession.sendMessage([{ functionResponse }]);
-          await processResponse(nextResult, chatSession, conversationId);
+          if (!account) {
+            const functionResponse = {
+              name: call.name,
+              response: {
+                error: 'Wallet not connected. User must connect their wallet first to view balances.',
+              },
+            };
+            const nextResult = await chatSession.sendMessage([{ functionResponse }]);
+            await processResponse(nextResult, chatSession, conversationId);
+          } else {
+            const functionResponse = {
+              name: call.name,
+              response: {
+                taoBalance: balance,
+                currentNetuidAlphaBalance: myAlphaBalance,
+                allAlphaBalancesByNetuid: allAlphaBalances,
+                currentNetuid,
+              },
+            };
+            const nextResult = await chatSession.sendMessage([{ functionResponse }]);
+            await processResponse(nextResult, chatSession, conversationId);
+          }
         } else if (call.name === 'initiate_stake') {
           const { amount, netuid } = call.args as { amount: string; netuid: number };
           const estimatedAlpha = await simulateStakeAlpha(amount, netuid);
@@ -282,30 +330,42 @@ export default function ChatPortal({
           ]);
         } else if (call.name === 'initiate_unstake') {
           const { netuid, amount } = call.args as { netuid: number; amount?: string };
-          const alphaOnNetuid = Number.parseFloat(allAlphaBalances[netuid] || '0');
-          const amountToQuote = amount || allAlphaBalances[netuid] || '';
 
-          if (alphaOnNetuid <= 0) {
+          if (!account) {
             const functionResponse = {
               name: call.name,
               response: {
-                error: `User has no Alpha staked on netuid ${netuid}.`,
+                error: 'Wallet not connected. User must connect their wallet first to view stake balance or unstake.',
               },
             };
             const nextResult = await chatSession.sendMessage([{ functionResponse }]);
             await processResponse(nextResult, chatSession, conversationId);
           } else {
-            const estimatedTao = amountToQuote ? await simulateUnstakeTao(netuid, amountToQuote) : null;
-            updateMessages(conversationId, (previousMessages) => [
-              ...previousMessages,
-              {
-                role: 'model',
-                text: estimatedTao
-                  ? `I prepared an unstake intent for ${amount ? `${amount} Alpha` : 'the full Alpha position'} on Netuid ${netuid}. Simulation estimates about ${formatTokenAmount(estimatedTao)} TAO back to your wallet.`
-                  : `I prepared an unstake intent for ${amount ? `${amount} Alpha` : 'the full Alpha position'} on Netuid ${netuid}.`,
-                action: { type: 'unstake', netuid, amount, estimatedTao: estimatedTao ?? undefined },
-              },
-            ]);
+            const alphaOnNetuid = Number.parseFloat(allAlphaBalances[netuid] || '0');
+            const amountToQuote = amount || allAlphaBalances[netuid] || '';
+
+            if (alphaOnNetuid <= 0) {
+              const functionResponse = {
+                name: call.name,
+                response: {
+                  error: `User has no Alpha staked on netuid ${netuid}.`,
+                },
+              };
+              const nextResult = await chatSession.sendMessage([{ functionResponse }]);
+              await processResponse(nextResult, chatSession, conversationId);
+            } else {
+              const estimatedTao = amountToQuote ? await simulateUnstakeTao(netuid, amountToQuote) : null;
+              updateMessages(conversationId, (previousMessages) => [
+                ...previousMessages,
+                {
+                  role: 'model',
+                  text: estimatedTao
+                    ? `I prepared an unstake intent for ${amount ? `${amount} Alpha` : 'the full Alpha position'} on Netuid ${netuid}. Simulation estimates about ${formatTokenAmount(estimatedTao)} TAO back to your wallet.`
+                    : `I prepared an unstake intent for ${amount ? `${amount} Alpha` : 'the full Alpha position'} on Netuid ${netuid}.`,
+                  action: { type: 'unstake', netuid, amount, estimatedTao: estimatedTao ?? undefined },
+                },
+              ]);
+            }
           }
         } else if (call.name === 'initiate_swap') {
           const { sourceNetuid, targetNetuid, amount } = call.args as {
@@ -313,47 +373,106 @@ export default function ChatPortal({
             targetNetuid: number;
             amount: string;
           };
-          const alphaOnSource = Number.parseFloat(allAlphaBalances[sourceNetuid] || '0');
 
-          if (sourceNetuid === targetNetuid) {
+          if (!account) {
             const functionResponse = {
               name: call.name,
               response: {
-                error: 'Source and destination netuid must be different for a subnet rotation.',
-              },
-            };
-            const nextResult = await chatSession.sendMessage([{ functionResponse }]);
-            await processResponse(nextResult, chatSession, conversationId);
-          } else if (alphaOnSource < Number.parseFloat(amount)) {
-            const functionResponse = {
-              name: call.name,
-              response: {
-                error: `User only has ${alphaOnSource} Alpha on source Netuid ${sourceNetuid}.`,
+                error: 'Wallet not connected. User must connect their wallet first to view stake balance or move positions.',
               },
             };
             const nextResult = await chatSession.sendMessage([{ functionResponse }]);
             await processResponse(nextResult, chatSession, conversationId);
           } else {
-            const simulation = await simulateSwapAlpha(sourceNetuid, targetNetuid, amount);
+            const alphaOnSource = Number.parseFloat(allAlphaBalances[sourceNetuid] || '0');
 
-            updateMessages(conversationId, (previousMessages) => [
-              ...previousMessages,
-              {
-                role: 'model',
-                text: simulation
-                  ? `I prepared a subnet rotation: move ${amount} ALPHA from Netuid ${sourceNetuid} to Netuid ${targetNetuid}. Simulation estimates about ${formatTokenAmount(simulation.targetAlpha)} ALPHA on the destination.`
-                  : `I prepared a subnet rotation: move ${amount} ALPHA from Netuid ${sourceNetuid} to Netuid ${targetNetuid}. Review it below and confirm when you are ready.`,
-                action: {
-                  type: 'swap',
-                  netuid: sourceNetuid,
-                  targetNetuid,
-                  amount,
-                  estimatedAlpha: simulation?.targetAlpha,
-                  intermediateTao: simulation?.intermediateTao,
+            if (sourceNetuid === targetNetuid) {
+              const functionResponse = {
+                name: call.name,
+                response: {
+                  error: 'Source and destination netuid must be different for a subnet rotation.',
                 },
-              },
-            ]);
+              };
+              const nextResult = await chatSession.sendMessage([{ functionResponse }]);
+              await processResponse(nextResult, chatSession, conversationId);
+            } else if (alphaOnSource < Number.parseFloat(amount)) {
+              const functionResponse = {
+                name: call.name,
+                response: {
+                  error: `User only has ${alphaOnSource} Alpha on source Netuid ${sourceNetuid}.`,
+                },
+              };
+              const nextResult = await chatSession.sendMessage([{ functionResponse }]);
+              await processResponse(nextResult, chatSession, conversationId);
+            } else {
+              const simulation = await simulateSwapAlpha(sourceNetuid, targetNetuid, amount);
+
+              updateMessages(conversationId, (previousMessages) => [
+                ...previousMessages,
+                {
+                  role: 'model',
+                  text: simulation
+                    ? `I prepared a subnet rotation: move ${amount} ALPHA from Netuid ${sourceNetuid} to Netuid ${targetNetuid}. Simulation estimates about ${formatTokenAmount(simulation.targetAlpha)} ALPHA on the destination.`
+                    : `I prepared a subnet rotation: move ${amount} ALPHA from Netuid ${sourceNetuid} to Netuid ${targetNetuid}. Review it below and confirm when you are ready.`,
+                  action: {
+                    type: 'swap',
+                    netuid: sourceNetuid,
+                    targetNetuid,
+                    amount,
+                    estimatedAlpha: simulation?.targetAlpha,
+                    intermediateTao: simulation?.intermediateTao,
+                  },
+                },
+              ]);
+            }
           }
+        } else if (call.name === 'get_subnet_details') {
+          const { netuid } = call.args as { netuid?: number };
+
+          let subnetsInfo: any[];
+
+          if (typeof netuid === 'number') {
+            // Single subnet — fetch live price via RPC
+            const presentation = getUiSubnetPresentation(netuid);
+            let alphaPrice = 'unavailable';
+            try {
+              const priceRes = await withRpcBackoff(() => activeProvider.send('swap_currentAlphaPrice', [netuid]));
+              if (priceRes) {
+                alphaPrice = ethers.formatUnits(priceRes, 9);
+              }
+            } catch (err) {
+              console.error(`Failed to get price for netuid ${netuid}:`, err);
+            }
+            subnetsInfo = [{
+              netuid,
+              name: presentation.name,
+              code: presentation.code,
+              category: presentation.category || 'N/A',
+              apy: presentation.apy || 'N/A',
+              hotkey: getHotkeyForNetuid(netuid),
+              alphaPriceInTao: alphaPrice,
+            }];
+          } else {
+            // All subnets — use local metadata only, no RPC calls
+            subnetsInfo = availableNetuids.map((id) => {
+              const presentation = getUiSubnetPresentation(id);
+              return {
+                netuid: id,
+                name: presentation.name,
+                code: presentation.code,
+                category: presentation.category || 'N/A',
+                apy: presentation.apy || 'N/A',
+                hotkey: getHotkeyForNetuid(id),
+              };
+            });
+          }
+
+          const functionResponse = {
+            name: call.name,
+            response: { subnets: subnetsInfo },
+          };
+          const nextResult = await chatSession.sendMessage([{ functionResponse }]);
+          await processResponse(nextResult, chatSession, conversationId);
         }
       }
     } else {
@@ -492,7 +611,18 @@ export default function ChatPortal({
                     <ReactMarkdown>{message.text}</ReactMarkdown>
                   </div>
 
-                  {message.action && (
+                  {message.action && message.action.type === 'wallet_connect' && (
+                    <button
+                      type="button"
+                      className="btn-confirm"
+                      style={{ marginTop: '10px', padding: '8px 18px', fontSize: '13px', borderRadius: '8px', width: 'auto' }}
+                      onClick={openWalletSelector}
+                    >
+                      Connect Wallet →
+                    </button>
+                  )}
+
+                  {message.action && message.action.type !== 'wallet_connect' && (
                     <div className="tcard">
                       <div className="tcard-head">
                         <span className="tcard-head-ic">
@@ -598,14 +728,22 @@ export default function ChatPortal({
                         <button
                           type="button"
                           className="btn-confirm"
-                          onClick={() => message.action && handleAction(message.action)}
-                          disabled={!account || status.type === 'loading'}
+                          onClick={() => {
+                            if (!account) {
+                              openWalletSelector();
+                            } else if (message.action) {
+                              handleAction(message.action);
+                            }
+                          }}
+                          disabled={status.type === 'loading'}
                         >
-                          {message.action.type === 'stake'
-                            ? 'Confirm & stake →'
-                            : message.action.type === 'unstake'
-                              ? 'Confirm & unstake →'
-                              : 'Confirm move →'}
+                          {!account
+                            ? 'Connect wallet to execute'
+                            : message.action.type === 'stake'
+                              ? 'Confirm & stake →'
+                              : message.action.type === 'unstake'
+                                ? 'Confirm & unstake →'
+                                : 'Confirm move →'}
                         </button>
                         <button type="button" className="btn-cancel" onClick={() => dismissAction(index)}>
                           Cancel
@@ -620,7 +758,7 @@ export default function ChatPortal({
             {loading && (
               <div className="thinking-row">
                 <Activity size={16} />
-                Thinking through the route...
+                Consulting the network...
               </div>
             )}
 

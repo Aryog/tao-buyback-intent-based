@@ -331,9 +331,10 @@ export default function AppContent() {
               executeSwap={app.executeSwap}
               status={app.status}
               openWalletSelector={app.openWalletModal}
-              disconnectWallet={app.disconnectWallet}
               onStartConversation={handleStartChatConversation}
               onUpdateConversationMessages={handleUpdateChatMessages}
+              getUiSubnetPresentation={app.getUiSubnetPresentation}
+              availableNetuids={app.availableNetuids}
             />
           )}
         </AppShell>
