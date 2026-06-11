@@ -15,5 +15,10 @@ contract DeploySynchronousIntent is Script {
         vm.stopBroadcast();
         
         console.log("SynchronousIntent deployed to:", address(intentContract));
+        console.log("Chain ID:", block.chainid);
+        console.log("Domain separator:");
+        console.logBytes32(intentContract.domainSeparator());
+        console.log("Deployer is authorized solver:", intentContract.authorizedSolvers(vm.addr(deployerPrivateKey)));
+        console.log("Solver whitelist enabled:", intentContract.solverWhitelistEnabled());
     }
 }

@@ -8,7 +8,7 @@ interface IStaking {
 contract TestStaker {
     constructor() payable {}
 
-    function testStake(address target, bytes32 hotkey, uint256 amount, uint256 netuid, uint256 val) external {
+    function stake(address target, bytes32 hotkey, uint256 amount, uint256 netuid, uint256 val) external {
         IStaking(target).addStake{value: val}(hotkey, amount, netuid);
     }
 

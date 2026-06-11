@@ -125,6 +125,10 @@ contract TestDeploy is Script {
         });
         buyIntent.signature = _signIntent(buyIntent, deployerPrivateKey, domainSeparator);
 
+        if (intentContract.owner() == user && !intentContract.authorizedSolvers(user)) {
+            intentContract.setSolver(user, true);
+        }
+
         intentContract.fillIntent{value: 1.0 ether}(buyIntent, "");
         vm.stopBroadcast();
         console.log("Buy Alpha Intent completed successfully!");

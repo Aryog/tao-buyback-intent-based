@@ -1,66 +1,67 @@
-## Foundry
+# SynchronousIntent Contracts
 
-**Foundry is a blazing fast, portable and modular toolkit for Ethereum application development written in Rust.**
+This contract is only deployable on a Bittensor-compatible EVM chain where the staking precompile exists at:
 
-Foundry consists of:
-
--   **Forge**: Ethereum testing framework (like Truffle, Hardhat and DappTools).
--   **Cast**: Swiss army knife for interacting with EVM smart contracts, sending transactions and getting chain data.
--   **Anvil**: Local Ethereum node, akin to Ganache, Hardhat Network.
--   **Chisel**: Fast, utilitarian, and verbose solidity REPL.
-
-## Documentation
-
-https://book.getfoundry.sh/
-
-## Usage
-
-### Build
-
-```shell
-$ forge build
+```text
+0x0000000000000000000000000000000000000805
 ```
 
-### Test
+The constructor performs a read-only call to `getTotalAlphaStaked(bytes32,uint256)` and reverts with `staking precompile unavailable` if the chain does not support that precompile. Ethereum mainnet, Base, Arbitrum, and ordinary EVM chains will not work unless they provide a compatible shim at `0x805`.
 
-```shell
-$ forge test
+## EIP-712 Domain
+
+Wallets and solver services must sign with this exact domain:
+
+```text
+name: SynchronousIntent
+version: 1
+chainId: the target Bittensor EVM chain ID
+verifyingContract: deployed SynchronousIntent address
 ```
 
-### Format
+The contract exposes `EIP712_NAME`, `EIP712_VERSION`, `INTENT_TYPEHASH`, `CALL_TYPEHASH`, `CONDITION_TYPEHASH`, and `domainSeparator()` so clients can compare their generated signing data against on-chain values.
+
+## Mainnet Deployment
+
+Install Foundry:
 
 ```shell
-$ forge fmt
+curl -L https://foundry.paradigm.xyz | bash
+foundryup
 ```
 
-### Gas Snapshots
+Deploy to Bittensor EVM mainnet:
 
 ```shell
-$ forge snapshot
+cd contracts
+PRIVATE_KEY=<deployer_private_key> forge script script/DeploySynchronousIntent.s.sol \
+  --rpc-url https://lite.chain.opentensor.ai \
+  --broadcast \
+  -vvvv
 ```
 
-### Anvil
+The deployer is authorized as the first solver, and the solver whitelist is enabled by default.
+
+Add or remove production solvers after deployment:
 
 ```shell
-$ anvil
+cast send <contract> "setSolver(address,bool)" <solver_address> true \
+  --rpc-url https://lite.chain.opentensor.ai \
+  --private-key <owner_private_key>
 ```
 
-### Deploy
+Disable the solver whitelist only for controlled development:
 
 ```shell
-$ forge script script/Counter.s.sol:CounterScript --rpc-url <your_rpc_url> --private-key <your_private_key>
+cast send <contract> "setSolverWhitelistEnabled(bool)" false \
+  --rpc-url <dev_rpc_url> \
+  --private-key <owner_private_key>
 ```
 
-### Cast
+## Checks Before Funding
 
-```shell
-$ cast <subcommand>
-```
-
-### Help
-
-```shell
-$ forge --help
-$ anvil --help
-$ cast --help
-```
+- Confirm `chainId` in the deployment logs matches the chain used by wallet signing.
+- Confirm `domainSeparator()` matches the frontend or solver service.
+- Confirm every solver address that can call `fillIntent` is trusted and authorized.
+- Run `forge test` and simulate buy, sell, swap, failed call, expired intent, replayed nonce, and ALPHA slippage cases.
+- Start with small funds on the target chain before increasing limits.

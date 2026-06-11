@@ -97,14 +97,16 @@ contract SynchronousIntentTest is Test {
     bytes32 private constant INTENT_TYPEHASH = keccak256("Intent(address user,Call[] calls,Condition condition,uint256 deadline,uint256 nonce)Call(address target,uint256 value,bytes callData)Condition(uint8 asset,uint256 minOutput,bytes32 hotkey,uint16 netuid)");
 
     function setUp() public {
+        vm.etch(ISTAKING_ADDRESS, address(new MockStakingPrecompile()).code);
+        vm.deal(ISTAKING_ADDRESS, 1000 * 1e18);
+
         intentContract = new SynchronousIntent();
         solver = new MockSolver(intentContract);
 
+        intentContract.setSolver(solverAddr, true);
+
         vm.deal(user, 100 * 1e18);
         vm.deal(solverAddr, 1000 * 1e18);
-
-        vm.etch(ISTAKING_ADDRESS, address(new MockStakingPrecompile()).code);
-        vm.deal(ISTAKING_ADDRESS, 1000 * 1e18);
     }
 
     function _hashCondition(Condition memory condition) internal pure returns (bytes32) {
@@ -180,11 +182,45 @@ contract SynchronousIntentTest is Test {
         vm.stopPrank();
 
         assertEq(MockStakingPrecompile(payable(ISTAKING_ADDRESS)).getTotalAlphaStaked(testHotkey, testNetuid), 50 * 1e9);
-        assertTrue(intentContract.usedNonces(1));
+        assertTrue(intentContract.usedNonces(user, 1));
+    }
+
+    function test_UnauthorizedSolverReverts() public {
+        Call[] memory calls = new Call[](1);
+        calls[0] = Call({
+            target: ISTAKING_ADDRESS,
+            value: 50 * 1e18,
+            callData: abi.encodeWithSelector(IStaking.addStake.selector, testHotkey, 50 * 1e9, testNetuid)
+        });
+
+        Condition memory cond = Condition({
+            asset: AssetType.ALPHA,
+            minOutput: 50 * 1e9,
+            hotkey: testHotkey,
+            netuid: testNetuid
+        });
+
+        Intent memory intent = Intent({
+            user: user,
+            calls: calls,
+            condition: cond,
+            deadline: block.timestamp + 100,
+            nonce: 1,
+            signature: ""
+        });
+        intent.signature = _signIntent(intent, userPk);
+
+        address unauthorizedSolver = address(0x123);
+        vm.deal(unauthorizedSolver, 100 * 1e18);
+
+        vm.prank(unauthorizedSolver);
+        vm.expectRevert("solver not authorized");
+        intentContract.fillIntent{value: 50 * 1e18}(intent, "");
     }
 
     function test_SellAlphaSuccess() public {
         MockStakingPrecompile(payable(ISTAKING_ADDRESS)).setStake(testHotkey, testNetuid, 50 * 1e9);
+        vm.deal(address(intentContract), 7 * 1e18);
 
         Call[] memory calls = new Call[](1);
         calls[0] = Call({
@@ -219,6 +255,7 @@ contract SynchronousIntentTest is Test {
 
         assertEq(user.balance - userBalBefore, 45 * 1e18); // User gets exact minOutput
         assertEq(solverAddr.balance - solverBalBefore, 5 * 1e18); // Solver gets the 5 TAO spread
+        assertEq(address(intentContract).balance, 7 * 1e18); // Stuck funds are not swept to solver
     }
 
     function test_SwapAlphaSuccess() public {
