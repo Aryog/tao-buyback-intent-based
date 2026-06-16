@@ -7,7 +7,6 @@ export const STAKING_PRECOMPILE_ADDRESS = '0x00000000000000000000000000000000000
 
 export interface IntentCall {
   target: string;
-  value: bigint;
   callData: string;
 }
 
@@ -24,6 +23,18 @@ export const getIntentTiming = () => {
     deadline: Math.floor(now / 1000) + 3600,
     nonce: now,
   };
+};
+
+// The contract rejects any intent with minOutput == 0, so every flow must derive
+// a real floor from a live quote rather than disabling slippage protection.
+export const OUTPUT_SLIPPAGE_TOLERANCE_BPS = 200n; // 2%
+
+export const applySlippageFloor = (
+  expectedAmountRao: bigint,
+  toleranceBps: bigint = OUTPUT_SLIPPAGE_TOLERANCE_BPS,
+): bigint => {
+  if (expectedAmountRao <= 0n) return 0n;
+  return expectedAmountRao - (expectedAmountRao * toleranceBps) / 10000n;
 };
 
 export const contractInterface = new ethers.Interface(CONTRACT_ABI);

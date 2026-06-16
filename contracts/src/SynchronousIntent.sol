@@ -6,15 +6,12 @@ import "openzeppelin-contracts/contracts/utils/cryptography/EIP712.sol";
 import "openzeppelin-contracts/contracts/security/ReentrancyGuard.sol";
 
 address constant ISTAKING_ADDRESS = 0x0000000000000000000000000000000000000805;
-uint256 constant BITTENSOR_TESTNET_CHAIN_ID = 945;
-uint256 constant BITTENSOR_MAINNET_CHAIN_ID = 964;
 
 interface IStaking {
     function addStake(bytes32 hotkey, uint256 amount, uint256 netuid) external;
     function removeStake(bytes32 hotkey, uint256 amount, uint256 netuid) external;
     function removeStakeFull(bytes32 hotkey, uint256 netuid) external;
     function getTotalAlphaStaked(bytes32 hotkey, uint256 netuid) external view returns (uint256);
-    function getStake(bytes32 hotkey, bytes32 coldkey, uint256 netuid) external view returns (uint256);
 }
 
 interface ISolver {
@@ -26,13 +23,12 @@ enum AssetType { TAO, ALPHA }
 struct Condition {
     AssetType asset;
     uint256 minOutput;
-    bytes32 hotkey; 
-    uint16 netuid;  
+    bytes32 hotkey;
+    uint16 netuid;
 }
 
 struct Call {
     address target;
-    uint256 value;
     bytes callData;
 }
 
@@ -47,76 +43,39 @@ struct Intent {
 
 /**
  * @title SynchronousIntent
- * @dev Universal Intent Executor. Blindly executes dynamic callData provided by AI Agents
- *      and mathematically guarantees the output condition is met.
+ * @dev Executes a user's own signed intent against the Bittensor staking
+ *      precompile and mathematically guarantees the output condition is met.
+ *      Only the signing user may fill their own intent — there is no
+ *      third-party solver delegation, so the output check (which reads the
+ *      hotkey-wide stake total, the only check computable on-chain here) can
+ *      never be gamed by an untrusted third party.
  */
 contract SynchronousIntent is EIP712, ReentrancyGuard {
-    address public owner;
-    bool public solverWhitelistEnabled = true;
-
     // TypeHashes for EIP712 Signature Verification
     string public constant EIP712_NAME = "SynchronousIntent";
     string public constant EIP712_VERSION = "1";
     string public constant CONDITION_TYPE = "Condition(uint8 asset,uint256 minOutput,bytes32 hotkey,uint16 netuid)";
-    string public constant CALL_TYPE = "Call(address target,uint256 value,bytes callData)";
+    string public constant CALL_TYPE = "Call(address target,bytes callData)";
     string public constant INTENT_TYPE =
-        "Intent(address user,Call[] calls,Condition condition,uint256 deadline,uint256 nonce)Call(address target,uint256 value,bytes callData)Condition(uint8 asset,uint256 minOutput,bytes32 hotkey,uint16 netuid)";
+        "Intent(address user,Call[] calls,Condition condition,uint256 deadline,uint256 nonce)Call(address target,bytes callData)Condition(uint8 asset,uint256 minOutput,bytes32 hotkey,uint16 netuid)";
 
     bytes32 public constant CONDITION_TYPEHASH = keccak256(bytes(CONDITION_TYPE));
     bytes32 public constant CALL_TYPEHASH = keccak256(bytes(CALL_TYPE));
     bytes32 public constant INTENT_TYPEHASH = keccak256(bytes(INTENT_TYPE));
 
     mapping(address => mapping(uint256 => bool)) public usedNonces;
-    mapping(address => bool) public authorizedSolvers;
 
     event IntentFilled(address indexed user, address indexed solver, uint256 nonce);
-    event SolverAuthorizationUpdated(address indexed solver, bool authorized);
-    event SolverWhitelistUpdated(bool enabled);
-    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
-
-    modifier onlyOwner() {
-        require(msg.sender == owner, "not owner");
-        _;
-    }
 
     constructor() EIP712(EIP712_NAME, EIP712_VERSION) {
         require(_stakingPrecompileAvailable(), "staking precompile unavailable");
-        owner = msg.sender;
-        authorizedSolvers[msg.sender] = true;
-        emit OwnershipTransferred(address(0), msg.sender);
-        emit SolverAuthorizationUpdated(msg.sender, true);
-    }
-
-    function getColdkey() public view returns (bytes32) {
-        return bytes32(uint256(uint160(address(this))));
     }
 
     function domainSeparator() public view returns (bytes32) {
         return _domainSeparatorV4();
     }
 
-    function setSolver(address solver, bool authorized) external onlyOwner {
-        require(solver != address(0), "zero solver");
-        authorizedSolvers[solver] = authorized;
-        emit SolverAuthorizationUpdated(solver, authorized);
-    }
-
-    function setSolverWhitelistEnabled(bool enabled) external onlyOwner {
-        solverWhitelistEnabled = enabled;
-        emit SolverWhitelistUpdated(enabled);
-    }
-
-    function transferOwnership(address newOwner) external onlyOwner {
-        require(newOwner != address(0), "zero owner");
-        emit OwnershipTransferred(owner, newOwner);
-        owner = newOwner;
-    }
-
     function _stakingPrecompileAvailable() internal view returns (bool) {
-        if (block.chainid == BITTENSOR_TESTNET_CHAIN_ID || block.chainid == BITTENSOR_MAINNET_CHAIN_ID) {
-            return true;
-        }
-
         (bool success, bytes memory result) = ISTAKING_ADDRESS.staticcall(
             abi.encodeWithSelector(IStaking.getTotalAlphaStaked.selector, bytes32(0), uint256(0))
         );
@@ -139,7 +98,6 @@ contract SynchronousIntent is EIP712, ReentrancyGuard {
             callHashes[i] = keccak256(abi.encode(
                 CALL_TYPEHASH,
                 calls[i].target,
-                calls[i].value,
                 keccak256(calls[i].callData)
             ));
         }
@@ -162,12 +120,31 @@ contract SynchronousIntent is EIP712, ReentrancyGuard {
         return signer == intent.user;
     }
 
+    /// @dev The staking precompile debits/credits the calling contract's own balance
+    ///      directly as part of its dispatch logic; it does not use EVM call value.
+    ///      Calls here are therefore made with no attached value, and the contract
+    ///      must already hold the TAO it needs (from `msg.value` on this call, or
+    ///      from proceeds of an earlier call in the same intent, e.g. an unstake
+    ///      leg funding a subsequent stake leg).
     function fillIntent(Intent calldata intent, bytes calldata solverData) external payable nonReentrant {
-        require(!solverWhitelistEnabled || authorizedSolvers[msg.sender], "solver not authorized");
+        require(msg.sender == intent.user, "only user can fill own intent");
         require(_verifySignature(intent), "bad sig");
         require(block.timestamp <= intent.deadline, "expired");
         require(!usedNonces[intent.user][intent.nonce], "replayed");
-        
+        require(intent.calls.length > 0, "no calls");
+        require(intent.condition.minOutput > 0, "minOutput must be positive");
+
+        for (uint256 i = 0; i < intent.calls.length; i++) {
+            require(intent.calls[i].target == ISTAKING_ADDRESS, "invalid call target");
+            require(intent.calls[i].callData.length >= 4, "invalid call data");
+            bytes4 selector = bytes4(intent.calls[i].callData[0:4]);
+            require(
+                selector == IStaking.addStake.selector || selector == IStaking.removeStake.selector
+                    || selector == IStaking.removeStakeFull.selector,
+                "invalid call selector"
+            );
+        }
+
         // Mark used to prevent reentrancy loops
         usedNonces[intent.user][intent.nonce] = true;
 
@@ -175,41 +152,24 @@ contract SynchronousIntent is EIP712, ReentrancyGuard {
         uint256 protectedTaoBalance = address(this).balance > msg.value ? address(this).balance - msg.value : 0;
         uint256 taoBalanceBeforeCall = address(this).balance;
         uint256 alphaBalanceBeforeCall = 0;
-        
+
         if (intent.condition.asset == AssetType.ALPHA) {
             alphaBalanceBeforeCall = IStaking(ISTAKING_ADDRESS).getTotalAlphaStaked(intent.condition.hotkey, intent.condition.netuid);
         }
 
-        // 1. Solver callback to prepare state/funds
+        // Optional self-callback hook (e.g. for a smart-contract wallet acting as
+        // intent.user) to prepare state/funds before execution.
         if (solverData.length > 0) {
             ISolver(msg.sender).executeFill(solverData);
         }
 
-        // 2. Blindly execute the dynamic calls prepared by the AI agent
-        uint256 remainingMsgValue = msg.value;
-
+        // Execute the signed calls against the staking precompile only
         for (uint256 i = 0; i < intent.calls.length; i++) {
-            uint256 spendableTao = 0;
-            if (address(this).balance > protectedTaoBalance) {
-                spendableTao = address(this).balance - protectedTaoBalance;
-            }
-            if (spendableTao < remainingMsgValue) {
-                spendableTao = remainingMsgValue;
-            }
-            
-            require(spendableTao >= intent.calls[i].value, "Insufficient TAO for call");
-
-            if (remainingMsgValue >= intent.calls[i].value) {
-                remainingMsgValue -= intent.calls[i].value;
-            } else {
-                remainingMsgValue = 0;
-            }
-            
-            (bool success, ) = intent.calls[i].target.call{value: intent.calls[i].value}(intent.calls[i].callData);
+            (bool success, ) = intent.calls[i].target.call(intent.calls[i].callData);
             require(success, "AI function call failed");
         }
 
-        // 3. Verify the core guarantee mathematically
+        // Verify the core guarantee mathematically
         if (intent.condition.asset == AssetType.ALPHA) {
             uint256 alphaBalanceAfterCall = IStaking(ISTAKING_ADDRESS).getTotalAlphaStaked(intent.condition.hotkey, intent.condition.netuid);
             require(alphaBalanceAfterCall >= alphaBalanceBeforeCall, "ALPHA balance decreased");
@@ -225,8 +185,7 @@ contract SynchronousIntent is EIP712, ReentrancyGuard {
             _sendTao(intent.user, intent.condition.minOutput);
         }
 
-        // 4. Sweep remaining TAO to solver.
-        // This elegantly handles both refunding unspent msg.value AND paying the solver their spread fee.
+        // Sweep any remaining new TAO back to the user (e.g. unspent msg.value).
         uint256 remainingTao = 0;
         if (address(this).balance > protectedTaoBalance) {
             remainingTao = address(this).balance - protectedTaoBalance;

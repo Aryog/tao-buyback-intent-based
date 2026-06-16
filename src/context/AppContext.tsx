@@ -26,6 +26,7 @@ import type {
 import { AppContext, type AppContextValue, type Surface } from './appContextValue';
 import { getEvmColdkey, hexToBytes } from '../utils/coldkeys';
 import {
+  applySlippageFloor,
   CONTRACT_ABI,
   STAKING_PRECOMPILE_ADDRESS,
   getIntentTiming,
@@ -42,7 +43,7 @@ import {
   mergeHistoryEvents,
   type HistoryCacheEntry,
 } from '../utils/history';
-import { activeProvider, logRejectedRpcResult, settleRpcBatch, stakingPrecompile, toBigIntOrZero, withRpcBackoff } from '../utils/rpc';
+import { activeProvider, logRejectedRpcResult, settleRpcBatch, stakingPrecompile, toBigIntOrZero } from '../utils/rpc';
 import { decodeDelegations, decodeSubnetCatalog } from '../utils/scaleDecoders';
 import { simulateStakeAlpha, simulateSwapAlpha, simulateUnstakeTao } from '../utils/simulations';
 import { getHotkeyForNetuid, getMockApyForNetuid, getSubnetLabel, getSubnetPresentation } from '../utils/subnets';
@@ -640,7 +641,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
         ],
         Call: [
           { name: 'target', type: 'address' },
-          { name: 'value', type: 'uint256' },
           { name: 'callData', type: 'bytes' },
         ],
         Intent: [
@@ -710,21 +710,33 @@ export function AppProvider({ children }: { children: ReactNode }) {
           ? targetHotkey
           : getHotkeyForNetuid(targetNetuid);
 
+      setStatus({ type: 'loading', msg: 'Fetching Alpha output quote...' });
+      const expectedAlpha = await simulateStakeAlpha(amount, targetNetuid);
+      if (!expectedAlpha) {
+        setStatus({ type: 'error', msg: 'Unable to fetch a price quote for this stake. Please try again.' });
+        return false;
+      }
+      const minOutput = applySlippageFloor(ethers.parseUnits(expectedAlpha, 9));
+      if (minOutput <= 0n) {
+        setStatus({ type: 'error', msg: 'Quoted output is too small to guarantee a minimum.' });
+        return false;
+      }
+
       const calls = [
         {
           target: STAKING_PRECOMPILE_ADDRESS,
-          value: 0n,
           callData: stakingCallInterface.encodeFunctionData('addStake', [hotkey, amountInRao, targetNetuid]),
         },
       ];
 
       const condition = {
         asset: 1,
-        minOutput: 0n,
+        minOutput,
         hotkey,
         netuid: targetNetuid,
       };
 
+      setStatus({ type: 'loading', msg: `Preparing stake intent for ${amount} TAO...` });
       const txResult = await signAndExecuteIntent(calls, condition, amountInWei);
       if (txResult) {
         setSessionStakeHistory((prev) =>
@@ -786,6 +798,25 @@ export function AppProvider({ children }: { children: ReactNode }) {
         ? Number.parseFloat(amount).toFixed(9).replace(/\.?0+$/, '')
         : '';
 
+      const quoteAmount = truncatedAmount || allAlphaBalances[targetNetuid] || '';
+      if (!quoteAmount || Number.parseFloat(quoteAmount) <= 0) {
+        setStatus({ type: 'error', msg: 'Unable to determine an amount to quote for this unstake.' });
+        return false;
+      }
+
+      setStatus({ type: 'loading', msg: 'Fetching TAO output quote...' });
+      const expectedTao = await simulateUnstakeTao(targetNetuid, quoteAmount);
+      if (!expectedTao) {
+        setStatus({ type: 'error', msg: 'Unable to fetch a price quote for this unstake. Please try again.' });
+        return false;
+      }
+      // condition.minOutput for TAO output is denominated in wei, while the quote is rao.
+      const minOutput = applySlippageFloor(ethers.parseUnits(expectedTao, 9)) * 1000000000n;
+      if (minOutput <= 0n) {
+        setStatus({ type: 'error', msg: 'Quoted output is too small to guarantee a minimum.' });
+        return false;
+      }
+
       const callData =
         truncatedAmount
           ? stakingCallInterface.encodeFunctionData('removeStake', [
@@ -798,18 +829,18 @@ export function AppProvider({ children }: { children: ReactNode }) {
       const calls = [
         {
           target: STAKING_PRECOMPILE_ADDRESS,
-          value: 0n,
           callData,
         },
       ];
 
       const condition = {
         asset: 0,
-        minOutput: 0n,
+        minOutput,
         hotkey: ethers.ZeroHash,
         netuid: 0,
       };
 
+      setStatus({ type: 'loading', msg: 'Preparing unstake intent...' });
       const txResult = await signAndExecuteIntent(calls, condition, 0n);
       if (txResult) {
         setSessionStakeHistory((prev) =>
@@ -873,25 +904,32 @@ export function AppProvider({ children }: { children: ReactNode }) {
       const truncatedSwapAmount = Number.parseFloat(amount).toFixed(9).replace(/\.?0+$/, '');
       const amountInRao = ethers.parseUnits(truncatedSwapAmount, 9);
 
-      let priceInRao = 1000000000n;
-      try {
-        setStatus({ type: 'loading', msg: 'Fetching Alpha spot exchange rate...' });
-        const priceRes = await withRpcBackoff(() => activeProvider.send('swap_currentAlphaPrice', [sourceNetuid]));
-        if (priceRes) {
-          priceInRao = BigInt(priceRes);
-        }
-      } catch (error) {
-        console.error('Failed to query swap_currentAlphaPrice:', error);
+      setStatus({ type: 'loading', msg: 'Fetching Alpha output quote...' });
+      const swapEstimate = await simulateSwapAlpha(sourceNetuid, targetNetuid, truncatedSwapAmount);
+      if (!swapEstimate) {
+        setStatus({ type: 'error', msg: 'Unable to fetch a price quote for this swap. Please try again.' });
+        return false;
       }
-
-      const expectedTaoInRao = (amountInRao * priceInRao * 950n) / (1000n * 1000000000n);
+      const minOutput = applySlippageFloor(ethers.parseUnits(swapEstimate.targetAlpha, 9));
+      if (minOutput <= 0n) {
+        setStatus({ type: 'error', msg: 'Quoted output is too small to guarantee a minimum.' });
+        return false;
+      }
+      // addStake's amount is baked into the signed calldata, so it must be a safe
+      // underestimate of what removeStake will actually yield (the AMM-simulated
+      // quote), not a flat haircut off the spot price — otherwise addStake can
+      // request more TAO than the contract ends up holding and revert.
+      const expectedTaoInRao = applySlippageFloor(ethers.parseUnits(swapEstimate.intermediateTao, 9));
+      if (expectedTaoInRao <= 0n) {
+        setStatus({ type: 'error', msg: 'Quoted intermediate TAO amount is too small.' });
+        return false;
+      }
 
       setStatus({ type: 'loading', msg: 'Preparing subnet rotation intent...' });
 
       const calls = [
         {
           target: STAKING_PRECOMPILE_ADDRESS,
-          value: 0n,
           callData: stakingCallInterface.encodeFunctionData('removeStake', [
             sourceHotkey,
             amountInRao,
@@ -900,7 +938,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
         },
         {
           target: STAKING_PRECOMPILE_ADDRESS,
-          value: 0n,
           callData: stakingCallInterface.encodeFunctionData('addStake', [
             targetHotkey,
             expectedTaoInRao,
@@ -911,7 +948,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
       const condition = {
         asset: 1,
-        minOutput: 0n,
+        minOutput,
         hotkey: targetHotkey,
         netuid: targetNetuid,
       };
